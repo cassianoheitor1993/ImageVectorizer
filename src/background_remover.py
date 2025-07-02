@@ -240,66 +240,97 @@ class BackgroundRemover:
             print(f"Error detecting background colors: {str(e)}")
             return self._fallback_color_detection_simple(input_path)
     
-    def _fallback_color_detection(self, edge_pixels):
-        """Fallback color detection using histogram analysis"""
+    def detect_background_colors_gui(self, input_path, num_suggestions=6):
+        """
+        GUI-friendly version of background color detection that returns suggestions
+        without CLI prompts for user selection in the GUI.
+        
+        Returns:
+            list: List of (color_rgb, percentage, description) tuples
+        """
         try:
-            # Convert to integers for histogram
-            edge_pixels_int = edge_pixels.astype(np.uint8)
+            # Load and analyze image
+            image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+            if image is None:
+                return []
             
-            # Create color histogram
-            colors, counts = np.unique(edge_pixels_int.reshape(-1, 3), axis=0, return_counts=True)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Sort by frequency
-            sorted_indices = np.argsort(counts)[::-1]
+            # Get edge colors using existing analysis method
+            color_candidates = self._analyze_edge_colors(image_rgb)
             
+            if not color_candidates:
+                return self._fallback_corner_sampling(input_path)
+            
+            # Format suggestions for GUI
             suggestions = []
-            total_pixels = len(edge_pixels_int)
-            
-            for i in range(min(6, len(sorted_indices))):
-                idx = sorted_indices[i]
-                color_rgb = tuple(colors[idx])
-                percentage = (counts[idx] / total_pixels) * 100
+            for i, (color_rgb, percentage) in enumerate(color_candidates[:num_suggestions]):
                 description = self._describe_color(color_rgb)
-                suggestions.append((color_rgb, percentage, description))
+                suggestions.append((tuple(color_rgb), percentage, description))
             
             return suggestions
             
         except Exception as e:
-            print(f"Fallback color detection failed: {str(e)}")
-            return []
-    
-    def _fallback_color_detection_simple(self, input_path):
-        """Simple fallback using corner sampling"""
+            print(f"Error in GUI color detection: {e}")
+            return self._fallback_corner_sampling(input_path)
+
+    def _analyze_edge_colors(self, image_rgb):
+        """Analyze edge colors to find potential background colors"""
         try:
-            image = cv2.imread(input_path, cv2.IMREAD_COLOR)
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             height, width = image_rgb.shape[:2]
             
-            # Sample corners and edges
-            corner_pixels = [
-                image_rgb[0, 0],           # Top-left
-                image_rgb[0, width-1],     # Top-right
-                image_rgb[height-1, 0],    # Bottom-left
-                image_rgb[height-1, width-1],  # Bottom-right
-                image_rgb[0, width//2],    # Top-center
-                image_rgb[height-1, width//2],  # Bottom-center
-            ]
+            # Extract edge pixels (likely background)
+            edge_pixels = []
             
-            suggestions = []
-            for i, color in enumerate(corner_pixels):
-                color_rgb = tuple(map(int, color))
-                description = self._describe_color(color_rgb)
-                suggestions.append((color_rgb, 16.7, description))  # Equal weight
+            # Top and bottom edges
+            edge_thickness = max(5, min(height // 20, 20))
+            edge_pixels.extend(image_rgb[:edge_thickness, :].reshape(-1, 3))
+            edge_pixels.extend(image_rgb[-edge_thickness:, :].reshape(-1, 3))
             
-            return suggestions[:5]  # Return top 5
+            # Left and right edges
+            edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, :edge_thickness].reshape(-1, 3))
+            edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, -edge_thickness:].reshape(-1, 3))
+            
+            edge_pixels = np.array(edge_pixels, dtype=np.uint8)
+            
+            if len(edge_pixels) < 10:
+                return []
+            
+            # Use K-means clustering for color analysis
+            unique_pixels, inverse_indices = np.unique(edge_pixels, axis=0, return_inverse=True)
+            
+            if len(unique_pixels) < 3:
+                return [(color, 100.0/len(unique_pixels)) for color in unique_pixels]
+            
+            # Cluster colors
+            k = min(8, len(unique_pixels))
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(unique_pixels)
+            cluster_centers = kmeans.cluster_centers_.astype(np.uint8)
+            
+            # Map back to original pixels
+            original_labels = cluster_labels[inverse_indices]
+            
+            # Count pixels in each cluster
+            cluster_counts = Counter(original_labels)
+            total_pixels = len(edge_pixels)
+            
+            # Calculate color candidates with percentages
+            color_candidates = []
+            for cluster_id, count in cluster_counts.most_common():
+                color_rgb = cluster_centers[cluster_id]
+                percentage = (count / total_pixels) * 100
+                color_candidates.append((color_rgb, percentage))
+            
+            return color_candidates
             
         except Exception as e:
-            print(f"Simple fallback failed: {str(e)}")
+            print(f"Error in edge color analysis: {e}")
             return []
-    
-    def _describe_color(self, rgb_color):
+
+    def _describe_color(self, color_rgb):
         """Generate human-readable color description"""
-        r, g, b = rgb_color
+        r, g, b = color_rgb[:3]  # Handle both tuples and arrays
         
         # Define color ranges
         if r > 240 and g > 240 and b > 240:
@@ -330,7 +361,35 @@ class BackgroundRemover:
                 return "Cyan-ish"
             else:
                 return "Mixed Color"
-    
+
+    def _fallback_corner_sampling(self, input_path):
+        """Simple fallback using corner sampling"""
+        try:
+            image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = image_rgb.shape[:2]
+            
+            # Sample corners and edges
+            corner_pixels = [
+                image_rgb[0, 0],                    # Top-left
+                image_rgb[0, width-1],              # Top-right
+                image_rgb[height-1, 0],             # Bottom-left
+                image_rgb[height-1, width-1],       # Bottom-right
+                image_rgb[0, width//2],             # Top-center
+                image_rgb[height-1, width//2],      # Bottom-center
+            ]
+            
+            color_candidates = []
+            for color in corner_pixels:
+                color_rgb = tuple(color.astype(int))
+                color_candidates.append((color_rgb, 16.7))  # Equal weight
+            
+            return color_candidates[:5]  # Return top 5
+            
+        except Exception as e:
+            print(f"Error in fallback sampling: {e}")
+            return []
+
     def remove_background_with_suggestions(self, input_path, output_dir=None):
         """
         Remove background with automatic color detection and suggestions
@@ -674,4 +733,242 @@ class BackgroundRemover:
             
         except Exception as e:
             print(f"Error removing background with model {model_name}: {str(e)}")
+            raise
+    
+    def detect_background_colors_gui(self, image_path, num_suggestions=6):
+        """
+        Detect potential background colors from image - GUI version without CLI prompts
+        Returns list of (color_rgb, percentage, description) tuples
+        """
+        try:
+            # Load and preprocess image
+            image = cv2.imread(str(image_path))
+            if image is None:
+                return []
+            
+            # Convert to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Get edge-based color analysis
+            color_candidates = self._get_edge_colors(image_rgb)
+            
+            if not color_candidates:
+                return []
+            
+            # Format results for GUI
+            suggestions = []
+            for i, (color, percentage) in enumerate(color_candidates[:num_suggestions]):
+                description = self._get_color_description(color)
+                suggestions.append((tuple(color), percentage, description))
+            
+            return suggestions
+            
+        except Exception as e:
+            print(f"Error detecting background colors: {e}")
+            return []
+    
+    def _get_edge_colors(self, image_rgb):
+        """Extract and analyze edge colors from image"""
+        height, width = image_rgb.shape[:2]
+        
+        # Extract edge pixels (likely background)
+        edge_pixels = []
+        
+        # Top and bottom edges (full width)
+        edge_thickness = max(5, min(height // 20, 20))  # Adaptive edge thickness
+        edge_pixels.extend(image_rgb[:edge_thickness, :].reshape(-1, 3))
+        edge_pixels.extend(image_rgb[-edge_thickness:, :].reshape(-1, 3))
+        
+        # Left and right edges (remaining height)
+        edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, :edge_thickness].reshape(-1, 3))
+        edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, -edge_thickness:].reshape(-1, 3))
+        
+        # Convert to numpy array with proper data type
+        edge_pixels = np.array(edge_pixels, dtype=np.float64)
+        
+        if len(edge_pixels) == 0:
+            return []
+        
+        # Remove any invalid values and ensure valid range
+        edge_pixels = edge_pixels[np.isfinite(edge_pixels).all(axis=1)]
+        edge_pixels = np.clip(edge_pixels, 0, 255)
+        
+        if len(edge_pixels) < 10:
+            return []
+        
+        # Remove duplicate pixels
+        unique_pixels, inverse_indices = np.unique(edge_pixels, axis=0, return_inverse=True)
+        
+        if len(unique_pixels) < 5:
+            return []
+        
+        # Use K-means clustering
+        k = min(8, len(unique_pixels) // 5, 20)
+        k = max(2, k)
+        
+        # Normalize pixel values
+        unique_pixels_normalized = unique_pixels / 255.0
+        
+        # Add small random noise to prevent numerical issues
+        noise = np.random.normal(0, 1e-6, unique_pixels_normalized.shape)
+        unique_pixels_normalized += noise
+        unique_pixels_normalized = np.clip(unique_pixels_normalized, 0, 1)
+        
+        try:
+            kmeans = KMeans(
+                n_clusters=k,
+                init='k-means++',
+                n_init=5,
+                max_iter=50,
+                tol=1e-3,
+                random_state=42,
+                algorithm='lloyd'
+            )
+            
+            cluster_labels = kmeans.fit_predict(unique_pixels_normalized)
+            cluster_centers = kmeans.cluster_centers_ * 255.0
+            
+            # Map back to original pixels
+            original_labels = cluster_labels[inverse_indices]
+            
+        except Exception:
+            return self._fallback_color_detection_gui(edge_pixels)
+        
+        # Count pixels in each cluster
+        cluster_counts = Counter(original_labels)
+        total_edge_pixels = len(edge_pixels)
+        
+        # Calculate color suggestions with percentages
+        color_candidates = []
+        for cluster_id, count in cluster_counts.most_common():
+            color_rgb = np.clip(cluster_centers[cluster_id], 0, 255).astype(int)
+            percentage = (count / total_edge_pixels) * 100
+            color_candidates.append((color_rgb, percentage))
+        
+        return color_candidates
+    
+    def _get_color_description(self, color_rgb):
+        """Generate human-readable color description"""
+        r, g, b = color_rgb
+        
+        # Define color ranges
+        if r > 240 and g > 240 and b > 240:
+            return "White/Very Light"
+        elif r < 15 and g < 15 and b < 15:
+            return "Black/Very Dark"
+        elif abs(r - g) < 20 and abs(g - b) < 20 and abs(r - b) < 20:
+            if r > 200:
+                return "Light Gray"
+            elif r > 100:
+                return "Medium Gray"
+            else:
+                return "Dark Gray"
+        else:
+            # Determine dominant color
+            max_val = max(r, g, b)
+            if r == max_val and r > g + 30 and r > b + 30:
+                return "Red-ish"
+            elif g == max_val and g > r + 30 and g > b + 30:
+                return "Green-ish"
+            elif b == max_val and b > r + 30 and b > g + 30:
+                return "Blue-ish"
+            elif r > 200 and g > 200 and b < 100:
+                return "Yellow-ish"
+            elif r > 200 and g < 100 and b > 200:
+                return "Magenta-ish"
+            elif r < 100 and g > 200 and b > 200:
+                return "Cyan-ish"
+            else:
+                return "Mixed Color"
+    
+    def _fallback_color_detection_gui(self, edge_pixels):
+        """GUI-friendly fallback color detection using histogram analysis"""
+        try:
+            # Convert to integers for histogram
+            edge_pixels_int = edge_pixels.astype(np.uint8)
+            
+            # Create color histogram
+            colors, counts = np.unique(edge_pixels_int.reshape(-1, 3), axis=0, return_counts=True)
+            
+            # Sort by frequency
+            sorted_indices = np.argsort(counts)[::-1]
+            
+            color_candidates = []
+            total_pixels = len(edge_pixels_int)
+            
+            for i in range(min(6, len(sorted_indices))):
+                idx = sorted_indices[i]
+                color_rgb = colors[idx]
+                percentage = (counts[idx] / total_pixels) * 100
+                color_candidates.append((color_rgb, percentage))
+            
+            return color_candidates
+            
+        except Exception:
+            return []
+    
+    def _fallback_color_detection_simple_gui(self, input_path):
+        """Simple GUI-friendly fallback using corner sampling"""
+        try:
+            image = cv2.imread(input_path, cv2.IMREAD_COLOR)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = image_rgb.shape[:2];
+            
+            # Sample corners and edges
+            corner_pixels = [
+                image_rgb[0, 0],           # Top-left
+                image_rgb[0, width-1],     # Top-right
+                image_rgb[height-1, 0],    # Bottom-left
+                image_rgb[height-1, width-1],  # Bottom-right
+                image_rgb[0, width//2],    # Top-center
+                image_rgb[height-1, width//2],  # Bottom-center
+            ]
+            
+            color_candidates = []
+            for color in corner_pixels:
+                color_rgb = color.astype(int)
+                color_candidates.append((color_rgb, 16.7))  # Equal weight
+            
+            return color_candidates[:5]  # Return top 5
+            
+        except Exception:
+            return []
+    
+    def process_selected_colors(self, image_path, selected_colors, tolerance=30):
+        """
+        Process selected colors for background removal - GUI version
+        
+        Args:
+            image_path (str): Path to input image
+            selected_colors (list): List of (color_rgb, description) tuples
+            tolerance (int): Color tolerance for removal
+            
+        Returns:
+            dict: Results with processed images
+        """
+        try:
+            input_path_obj = Path(image_path)
+            output_dir = input_path_obj.parent
+            
+            results = {'original': str(image_path), 'processed': []}
+            
+            for color_rgb, description in selected_colors:
+                output_path = output_dir / f"{input_path_obj.stem}_no_{description.lower().replace('/', '_').replace(' ', '_')}.png"
+                
+                try:
+                    result = self.remove_color_background_hq(
+                        image_path, str(output_path), color_rgb, tolerance
+                    )
+                    results['processed'].append({
+                        'color': color_rgb, 
+                        'description': description, 
+                        'path': result
+                    })
+                except Exception as e:
+                    print(f"Failed to process {description}: {str(e)}")
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error processing selected colors: {str(e)}")
             raise
