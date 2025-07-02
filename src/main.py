@@ -153,10 +153,20 @@ def main():
                 print("\n🔄 Complete high-quality processing pipeline...")
                 try:
                     results = processor.process_complete_hq(image_path)
-                    print(f"✅ Complete high-quality processing finished!")
-                    print(f"📄 Original: {results['original']}")
-                    print(f"📄 Background removed: {results['background_removed']}")
-                    print(f"📄 Vectorized: {results['vectorized']}")
+                    if 'error' in results:
+                        print(f"❌ {results['error']}")
+                    else:
+                        print(f"✅ Complete processing finished!")
+                        print(f"📄 Original: {results['original']}")
+                        print(f"📄 Background removed: {results['best_background_removed']}")
+                        print(f"📄 Final vector: {results['final_vector']}")
+                        
+                        # Show summary of all background removal results
+                        bg_results = results['background_removal_results']
+                        if bg_results and bg_results.get('processed'):
+                            print(f"📄 Generated {len(bg_results['processed'])} background-removed variations:")
+                            for i, result in enumerate(bg_results['processed'], 1):
+                                print(f"   {i}. {result['description']}: {result['path']}")
                 except Exception as e:
                     print(f"❌ Error: {str(e)}")
                     

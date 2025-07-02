@@ -6,10 +6,13 @@ from pathlib import Path
 from rembg import remove
 from collections import Counter
 from sklearn.cluster import KMeans
+import warnings
 
 class BackgroundRemover:
     def __init__(self):
         """Initialize the background remover"""
+        # Suppress sklearn warnings for cleaner output
+        warnings.filterwarnings('ignore', category=RuntimeWarning, module='sklearn')
         pass
     
     def remove_background(self, input_path, output_path):
@@ -141,58 +144,157 @@ class BackgroundRemover:
             list: List of tuples (color_rgb, percentage, description)
         """
         try:
-            # Load image with high quality
-            image = cv2.imread(input_path, cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Could not load image: {input_path}")
-            
-            # Convert to RGB
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            height, width = image_rgb.shape[:2]
-            
-            # Extract edge pixels (likely background)
-            edge_pixels = []
-            
-            # Top and bottom edges (full width)
-            edge_thickness = max(5, min(height // 20, 20))  # Adaptive edge thickness
-            edge_pixels.extend(image_rgb[:edge_thickness, :].reshape(-1, 3))
-            edge_pixels.extend(image_rgb[-edge_thickness:, :].reshape(-1, 3))
-            
-            # Left and right edges (remaining height)
-            edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, :edge_thickness].reshape(-1, 3))
-            edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, -edge_thickness:].reshape(-1, 3))
-            
-            # Convert to numpy array
-            edge_pixels = np.array(edge_pixels)
-            
-            if len(edge_pixels) == 0:
-                return []
-            
-            # Use K-means clustering to find dominant edge colors
-            k = min(num_suggestions * 2, len(edge_pixels) // 10, 50)  # Adaptive K
-            if k < 2:
-                k = 2
+            # Suppress warnings for this function
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
                 
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            cluster_labels = kmeans.fit_predict(edge_pixels)
-            cluster_centers = kmeans.cluster_centers_
+                # Load image with high quality
+                image = cv2.imread(input_path, cv2.IMREAD_COLOR)
+                if image is None:
+                    raise ValueError(f"Could not load image: {input_path}")
+                
+                # Convert to RGB
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                height, width = image_rgb.shape[:2]
+                
+                # Extract edge pixels (likely background)
+                edge_pixels = []
+                
+                # Top and bottom edges (full width)
+                edge_thickness = max(5, min(height // 20, 20))  # Adaptive edge thickness
+                edge_pixels.extend(image_rgb[:edge_thickness, :].reshape(-1, 3))
+                edge_pixels.extend(image_rgb[-edge_thickness:, :].reshape(-1, 3))
+                
+                # Left and right edges (remaining height)
+                edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, :edge_thickness].reshape(-1, 3))
+                edge_pixels.extend(image_rgb[edge_thickness:-edge_thickness, -edge_thickness:].reshape(-1, 3))
+                
+                # Convert to numpy array with proper data type and range checking
+                edge_pixels = np.array(edge_pixels, dtype=np.float64)  # Use float64 for better precision
+                
+                if len(edge_pixels) == 0:
+                    return []
+                
+                # Remove any invalid values and ensure valid range
+                edge_pixels = edge_pixels[np.isfinite(edge_pixels).all(axis=1)]
+                edge_pixels = np.clip(edge_pixels, 0, 255)  # Ensure valid color range
+                
+                if len(edge_pixels) < 10:  # Need minimum samples
+                    return self._fallback_color_detection_simple(input_path)
+                
+                # Remove duplicate pixels to reduce computational load and improve stability
+                unique_pixels, inverse_indices = np.unique(edge_pixels, axis=0, return_inverse=True)
+                
+                if len(unique_pixels) < 5:
+                    return self._fallback_color_detection_simple(input_path)
+                
+                # Use K-means clustering with improved stability
+                k = min(num_suggestions * 2, len(unique_pixels) // 5, 20)  # More conservative K
+                k = max(2, k)  # Ensure minimum clusters
+                
+                # Normalize pixel values to 0-1 range for better numerical stability
+                unique_pixels_normalized = unique_pixels / 255.0
+                
+                # Add small random noise to identical pixels to prevent numerical issues
+                noise = np.random.normal(0, 1e-6, unique_pixels_normalized.shape)
+                unique_pixels_normalized += noise
+                unique_pixels_normalized = np.clip(unique_pixels_normalized, 0, 1)
+                
+                try:
+                    # Use more robust K-means parameters
+                    kmeans = KMeans(
+                        n_clusters=k,
+                        init='k-means++',
+                        n_init=5,  # Reduced iterations for stability
+                        max_iter=50,  # Reduced max iterations
+                        tol=1e-3,  # Less strict tolerance
+                        random_state=42,
+                        algorithm='lloyd'  # Use Lloyd algorithm for stability
+                    )
+                    
+                    cluster_labels = kmeans.fit_predict(unique_pixels_normalized)
+                    cluster_centers = kmeans.cluster_centers_ * 255.0  # Scale back
+                    
+                    # Map back to original pixels
+                    original_labels = cluster_labels[inverse_indices]
+                    
+                except Exception as e:
+                    print(f"K-means failed, using histogram method: {str(e)}")
+                    return self._fallback_color_detection(edge_pixels)
+                
+                # Count pixels in each cluster
+                cluster_counts = Counter(original_labels)
+                total_edge_pixels = len(edge_pixels)
+                
+                # Calculate color suggestions with percentages
+                suggestions = []
+                for cluster_id, count in cluster_counts.most_common(num_suggestions):
+                    color_rgb = tuple(map(int, np.clip(cluster_centers[cluster_id], 0, 255)))
+                    percentage = (count / total_edge_pixels) * 100
+                    description = self._describe_color(color_rgb)
+                    suggestions.append((color_rgb, percentage, description))
+                
+                return suggestions
             
-            # Count pixels in each cluster
-            cluster_counts = Counter(cluster_labels)
-            total_edge_pixels = len(edge_pixels)
+        except Exception as e:
+            print(f"Error detecting background colors: {str(e)}")
+            return self._fallback_color_detection_simple(input_path)
+    
+    def _fallback_color_detection(self, edge_pixels):
+        """Fallback color detection using histogram analysis"""
+        try:
+            # Convert to integers for histogram
+            edge_pixels_int = edge_pixels.astype(np.uint8)
             
-            # Calculate color suggestions with percentages
+            # Create color histogram
+            colors, counts = np.unique(edge_pixels_int.reshape(-1, 3), axis=0, return_counts=True)
+            
+            # Sort by frequency
+            sorted_indices = np.argsort(counts)[::-1]
+            
             suggestions = []
-            for cluster_id, count in cluster_counts.most_common(num_suggestions):
-                color_rgb = tuple(map(int, cluster_centers[cluster_id]))
-                percentage = (count / total_edge_pixels) * 100
+            total_pixels = len(edge_pixels_int)
+            
+            for i in range(min(6, len(sorted_indices))):
+                idx = sorted_indices[i]
+                color_rgb = tuple(colors[idx])
+                percentage = (counts[idx] / total_pixels) * 100
                 description = self._describe_color(color_rgb)
                 suggestions.append((color_rgb, percentage, description))
             
             return suggestions
             
         except Exception as e:
-            print(f"Error detecting background colors: {str(e)}")
+            print(f"Fallback color detection failed: {str(e)}")
+            return []
+    
+    def _fallback_color_detection_simple(self, input_path):
+        """Simple fallback using corner sampling"""
+        try:
+            image = cv2.imread(input_path, cv2.IMREAD_COLOR)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = image_rgb.shape[:2]
+            
+            # Sample corners and edges
+            corner_pixels = [
+                image_rgb[0, 0],           # Top-left
+                image_rgb[0, width-1],     # Top-right
+                image_rgb[height-1, 0],    # Bottom-left
+                image_rgb[height-1, width-1],  # Bottom-right
+                image_rgb[0, width//2],    # Top-center
+                image_rgb[height-1, width//2],  # Bottom-center
+            ]
+            
+            suggestions = []
+            for i, color in enumerate(corner_pixels):
+                color_rgb = tuple(map(int, color))
+                description = self._describe_color(color_rgb)
+                suggestions.append((color_rgb, 16.7, description))  # Equal weight
+            
+            return suggestions[:5]  # Return top 5
+            
+        except Exception as e:
+            print(f"Simple fallback failed: {str(e)}")
             return []
     
     def _describe_color(self, rgb_color):

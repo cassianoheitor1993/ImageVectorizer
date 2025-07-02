@@ -81,6 +81,7 @@ class ImageProcessor:
         return {
             'original': image_path,
             'background_removal_results': bg_results,
+            'best_background_removed': best_bg_removed,
             'final_vector': vector_path
         }
     
