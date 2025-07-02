@@ -980,13 +980,67 @@ class ImageEditorGUI(QMainWindow):
         self.results_widget = QWidget()
         results_layout = QVBoxLayout(self.results_widget)
         
-        # Results list
-        self.results_list = QListWidget()
-        self.results_list.itemDoubleClicked.connect(self.open_result_file)
-        
+        # Results header with controls
+        results_header = QHBoxLayout()
         results_label = QLabel("📁 Generated Files:")
         results_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-bottom: 5px;")
-        results_layout.addWidget(results_label)
+        results_header.addWidget(results_label)
+        
+        # Add sort and delete controls
+        results_header.addStretch()
+        
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["📅 Newest First", "📅 Oldest First", "📝 A-Z", "📝 Z-A"])
+        self.sort_combo.setCurrentText("📅 Newest First")
+        self.sort_combo.currentTextChanged.connect(self.sort_results_list)
+        results_header.addWidget(QLabel("Sort:"))
+        results_header.addWidget(self.sort_combo)
+        
+        self.delete_selected_btn = QPushButton("🗑️ Delete Selected")
+        self.delete_selected_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                padding: 6px 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #c62828;
+            }
+            QPushButton:disabled {
+                background-color: #ffcdd2;
+                color: #999999;
+            }
+        """)
+        self.delete_selected_btn.clicked.connect(self.delete_selected_files)
+        self.delete_selected_btn.setEnabled(False)
+        results_header.addWidget(self.delete_selected_btn)
+        
+        self.clear_all_btn = QPushButton("🧹 Clear All")
+        self.clear_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f57c00;
+                padding: 6px 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #ef6c00;
+            }
+        """)
+        self.clear_all_btn.clicked.connect(self.clear_all_results)
+        results_header.addWidget(self.clear_all_btn)
+        
+        results_layout.addLayout(results_header)
+        
+        # Results list with multi-selection
+        self.results_list = QListWidget()
+        self.results_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.results_list.itemDoubleClicked.connect(self.open_result_file)
+        self.results_list.itemSelectionChanged.connect(self.on_selection_changed)
+        
+        # Add context menu
+        self.results_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.results_list.customContextMenuRequested.connect(self.show_context_menu)
+        
         results_layout.addWidget(self.results_list)
         
         # Log area
@@ -1191,17 +1245,188 @@ class ImageEditorGUI(QMainWindow):
         self.show_error(f"Processing failed: {error_message}")
     
     def add_result_file(self, file_path, description=None):
-        """Add result file to the list"""
+        """Add result file to the list with timestamp"""
         if not description:
             description = Path(file_path).name
         
-        item = QListWidgetItem(f"📄 {description}")
-        item.setData(Qt.ItemDataRole.UserRole, file_path)
-        self.results_list.addItem(item)
+        # Get file modification time
+        try:
+            mod_time = os.path.getmtime(file_path)
+            from datetime import datetime
+            formatted_time = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            formatted_time = "Unknown"
         
+        # Create item with timestamp data
+        display_text = f"📄 {description}"
+        item = QListWidgetItem(display_text)
+        item.setData(Qt.ItemDataRole.UserRole, file_path)
+        item.setData(Qt.ItemDataRole.UserRole + 1, mod_time)  # Store timestamp for sorting
+        item.setData(Qt.ItemDataRole.UserRole + 2, description)  # Store description
+        item.setToolTip(f"File: {file_path}\nModified: {formatted_time}")
+        
+        self.results_list.addItem(item)
         self.log_message(f"📄 Generated: {file_path}")
+        
+        # Auto-sort based on current selection
+        self.sort_results_list(self.sort_combo.currentText())
+    
+    def sort_results_list(self, order):
+        """Sort results list based on selected order"""
+        items_data = []
+        
+        # Extract all items with their data
+        for i in range(self.results_list.count()):
+            item = self.results_list.item(i)
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            timestamp = item.data(Qt.ItemDataRole.UserRole + 1) or 0
+            description = item.data(Qt.ItemDataRole.UserRole + 2) or ""
+            items_data.append((item.text(), file_path, timestamp, description, item.toolTip()))
+        
+        # Sort based on selected order
+        if order == "📅 Newest First":
+            items_data.sort(key=lambda x: x[2], reverse=True)  # Sort by timestamp descending
+        elif order == "📅 Oldest First":
+            items_data.sort(key=lambda x: x[2])  # Sort by timestamp ascending
+        elif order == "📝 A-Z":
+            items_data.sort(key=lambda x: x[3].lower())  # Sort by description A-Z
+        elif order == "📝 Z-A":
+            items_data.sort(key=lambda x: x[3].lower(), reverse=True)  # Sort by description Z-A
+        
+        # Clear and repopulate list
+        self.results_list.clear()
+        for text, file_path, timestamp, description, tooltip in items_data:
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, file_path)
+            item.setData(Qt.ItemDataRole.UserRole + 1, timestamp)
+            item.setData(Qt.ItemDataRole.UserRole + 2, description)
+            item.setToolTip(tooltip)
+            self.results_list.addItem(item)
+    
+    def delete_selected_files(self):
+        """Delete selected files from the list and filesystem"""
+        selected_items = self.results_list.selectedItems()
+        if not selected_items:
+            return
+        
+        file_paths = []
+        items_to_remove = []
+        
+        for item in selected_items:
+            file_path = item.data(Qt.ItemDataRole.UserRole)
+            if file_path and os.path.exists(file_path):
+                file_paths.append(file_path)
+                items_to_remove.append(item)
+        
+        if not file_paths:
+            self.show_error("No valid files selected for deletion")
+            return
+        
+        # Show confirmation dialog
+        file_list = "\n".join([Path(fp).name for fp in file_paths])
+        reply = QMessageBox.question(
+            self, 
+            "Confirm Deletion", 
+            f"Are you sure you want to permanently delete these {len(file_paths)} files?\n\n{file_list}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            deleted_count = 0
+            for file_path in file_paths:
+                try:
+                    os.remove(file_path)
+                    self.log_message(f"🗑️ Deleted: {Path(file_path).name}")
+                    deleted_count += 1
+                except Exception as e:
+                    self.log_message(f"❌ Error deleting {Path(file_path).name}: {str(e)}")
+            
+            # Remove items from list
+            for item in items_to_remove:
+                row = self.results_list.row(item)
+                if row >= 0:
+                    self.results_list.takeItem(row)
+            
+            if deleted_count > 0:
+                self.show_success(f"Successfully deleted {deleted_count} file(s)")
+        
+        # Update button state
+        self.on_selection_changed()
+    
+    def clear_all_results(self):
+        """Clear all results from the list without deleting files"""
+        if self.results_list.count() == 0:
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Clear Results",
+            "This will clear the results list but won't delete the actual files. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            count = self.results_list.count()
+            self.results_list.clear()
+            self.log_message(f"🧹 Cleared {count} results from list")
+    
+    def on_selection_changed(self):
+        """Update delete button state based on selection"""
+        selected_items = self.results_list.selectedItems()
+        self.delete_selected_btn.setEnabled(bool(selected_items))
+        
+        # Update button text with count
+        if selected_items:
+            count = len(selected_items)
+            self.delete_selected_btn.setText(f"🗑️ Delete Selected ({count})")
+        else:
+            self.delete_selected_btn.setText("🗑️ Delete Selected")
+    
+    def show_context_menu(self, pos):
+        """Show context menu for results list"""
+        item = self.results_list.itemAt(pos)
+        if not item:
+            return
+        
+        # Create context menu
+        menu = QMenu(self)
+        
+        open_action = menu.addAction("📂 Open File")
+        open_folder_action = menu.addAction("📁 Show in Folder")
+        menu.addSeparator()
+        delete_action = menu.addAction("🗑️ Delete File")
+        
+        # Execute action
+        action = menu.exec(self.results_list.mapToGlobal(pos))
+        
+        if action == open_action:
+            self.open_result_file(item)
+        elif action == open_folder_action:
+            self.show_in_folder(item)
+        elif action == delete_action:
+            # Temporarily select the item and delete
+            self.results_list.clearSelection()
+            item.setSelected(True)
+            self.delete_selected_files()
+    
+    def show_in_folder(self, item):
+        """Show file in folder/finder"""
+        file_path = item.data(Qt.ItemDataRole.UserRole)
+        if file_path and os.path.exists(file_path):
+            try:
+                if platform.system() == "Darwin":  # macOS
+                    os.system(f"open -R '{file_path}'")
+                elif platform.system() == "Windows":  # Windows
+                    os.system(f"explorer /select,\"{file_path}\"")
+                else:  # Linux
+                    folder_path = os.path.dirname(file_path)
+                    os.system(f"xdg-open '{folder_path}'")
+            except Exception as e:
+                self.show_error(f"Failed to show file in folder: {str(e)}")
 
-
+    # ...existing methods...
 def main():
     """Main application entry point"""
     app = QApplication(sys.argv)
